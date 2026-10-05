@@ -134,6 +134,43 @@ fn main() -> Result<(), serde_yaml::Error> {
 }
 ```
 
+## Multiple documents with explicit types
+
+`from_str` reads exactly one YAML document. To read a stream of several
+`---`-separated documents, where each document has its own independently
+chosen target type, use `serde_yaml::from_str_documents` with an explicit
+sequence of one target closure per document. Each document is read on its
+own: tags, anchors and aliases never leak from one document to the next. The
+number of documents must match the number of targets—fewer documents and
+extra documents are both diagnosed. An empty document is presented to its
+target as YAML `null`.
+
+```rust
+use serde_yaml::Value;
+
+let input = "---\nname: Ada\n---\nx: 1\ny: 2\n";
+
+let mut first = Value::Null;
+let mut second = Value::Null;
+serde_yaml::from_str_documents(
+    input,
+    &mut [
+        &mut |de| { first = Value::deserialize(de)?; Ok(()) },
+        &mut |de| { second = Value::deserialize(de)?; Ok(()) },
+    ],
+).unwrap();
+```
+
+A failure while reading document *n* is attributed to that document: the
+error carries the 1-based document number and the byte range it occupied,
+available from `Error::document()`. A three-document runnable example lives
+under [`examples/three_documents.rs`](examples/three_documents.rs):
+
+```sh
+cargo run --example three_documents
+cargo test --test test_documents
+```
+
 <br>
 
 #### License

@@ -11,6 +11,19 @@ use std::sync::Arc;
 /// An error that happened serializing or deserializing YAML data.
 pub struct Error(Box<ErrorImpl>);
 
+/// Information about a YAML document involved in a multi-document failure.
+///
+/// Returned by [`Error::document`](Error::document) when an error produced by
+/// [`from_str_documents`](crate::from_str_documents) can be attributed to a
+/// specific document in the input stream.
+#[derive(Clone, Debug)]
+pub struct DocumentError {
+    /// 1-based number of the document within the input stream.
+    document: usize,
+    /// Byte range occupied by the document in the input.
+    range: std::ops::Range<usize>,
+}
+
 /// Alias for a `Result` with the error type `serde_yaml::Error`.
 pub type Result<T> = result::Result<T, Error>;
 
@@ -24,6 +37,16 @@ pub(crate) enum ErrorImpl {
 
     EndOfStream,
     MoreThanOneDocument,
+    /// A document failed to deserialize; carries its 1-based document number,
+    /// the byte range it occupied in the input, and the underlying error.
+    Document(usize, std::ops::Range<usize>, Arc<ErrorImpl>),
+    /// More documents were present in the input than targets were registered.
+    /// Carries the 1-based number of the unexpected document, the number of
+    /// registered targets, and the document's byte range in the input.
+    UnexpectedDocument(usize, usize, std::ops::Range<usize>),
+    /// Fewer documents were present in the input than targets were registered.
+    /// Carries the number of documents found and the number of targets.
+    MissingDocuments(usize, usize),
     RecursionLimitExceeded(libyaml::Mark),
     RepetitionLimitExceeded,
     BytesUnsupported,
@@ -81,6 +104,28 @@ impl Location {
     }
 }
 
+impl DocumentError {
+    /// The 1-based number of the document within the input stream.
+    pub fn document(&self) -> usize {
+        self.document
+    }
+
+    /// The byte range occupied by the document in the input.
+    pub fn range(&self) -> std::ops::Range<usize> {
+        self.range.clone()
+    }
+
+    /// The byte index at which the document starts in the input.
+    pub fn start(&self) -> usize {
+        self.range.start
+    }
+
+    /// The byte index at which the document ends in the input.
+    pub fn end(&self) -> usize {
+        self.range.end
+    }
+}
+
 impl Error {
     /// Returns the Location from the error if one exists.
     ///
@@ -101,6 +146,33 @@ impl Error {
     /// ```
     pub fn location(&self) -> Option<Location> {
         self.0.location()
+    }
+
+    /// Returns information about the document that caused a multi-document
+    /// deserialization failure.
+    ///
+    /// This is `Some` for errors returned by
+    /// [`from_str_documents`](crate::from_str_documents) when an individual
+    /// document failed or when an unexpected extra document was encountered.
+    /// Count mismatches where documents are missing are not attributed to a
+    /// document and return `None`.
+    pub fn document(&self) -> Option<DocumentError> {
+        match self.0.as_ref() {
+            ErrorImpl::Document(number, range, _)
+            | ErrorImpl::UnexpectedDocument(number, _, range) => Some(DocumentError {
+                document: *number,
+                range: range.clone(),
+            }),
+            ErrorImpl::Shared(err) => match err.as_ref() {
+                ErrorImpl::Document(number, range, _)
+                | ErrorImpl::UnexpectedDocument(number, _, range) => Some(DocumentError {
+                    document: *number,
+                    range: range.clone(),
+                }),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 }
 
@@ -199,6 +271,7 @@ impl ErrorImpl {
             | ErrorImpl::RecursionLimitExceeded(mark)
             | ErrorImpl::UnknownAnchor(mark) => Some(*mark),
             ErrorImpl::Libyaml(err) => Some(err.mark()),
+            ErrorImpl::Document(_, _, inner) => inner.mark(),
             ErrorImpl::Shared(err) => err.mark(),
             _ => None,
         }
@@ -213,6 +286,7 @@ impl ErrorImpl {
                 }
                 f.write_str(msg)
             }
+            ErrorImpl::Document(_number, _range, inner) => inner.message_no_mark(f),
             ErrorImpl::Libyaml(_) => unreachable!(),
             ErrorImpl::Io(err) => Display::fmt(err, f),
             ErrorImpl::FromUtf8(err) => Display::fmt(err, f),
@@ -220,6 +294,20 @@ impl ErrorImpl {
             ErrorImpl::MoreThanOneDocument => f.write_str(
                 "deserializing from YAML containing more than one document is not supported",
             ),
+            ErrorImpl::UnexpectedDocument(number, expected, range) => {
+                write!(
+                    f,
+                    "unexpected document {} at bytes {}..{}: expected exactly {} document(s)",
+                    number, range.start, range.end, expected
+                )
+            }
+            ErrorImpl::MissingDocuments(found, expected) => {
+                write!(
+                    f,
+                    "expected {} YAML document(s), but found {}",
+                    expected, found
+                )
+            }
             ErrorImpl::RecursionLimitExceeded(_mark) => f.write_str("recursion limit exceeded"),
             ErrorImpl::RepetitionLimitExceeded => f.write_str("repetition limit exceeded"),
             ErrorImpl::BytesUnsupported => {
@@ -248,6 +336,14 @@ impl ErrorImpl {
     fn display(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ErrorImpl::Libyaml(err) => Display::fmt(err, f),
+            ErrorImpl::Document(number, range, inner) => {
+                write!(
+                    f,
+                    "document {} (bytes {}..{}): ",
+                    number, range.start, range.end
+                )?;
+                inner.display(f)
+            }
             ErrorImpl::Shared(err) => err.display(f),
             _ => {
                 self.message_no_mark(f)?;
@@ -264,6 +360,31 @@ impl ErrorImpl {
     fn debug(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ErrorImpl::Libyaml(err) => Debug::fmt(err, f),
+            ErrorImpl::Document(number, range, inner) => {
+                f.write_str("Error(")?;
+                write!(
+                    f,
+                    "document {}, bytes {}..{}, ",
+                    number, range.start, range.end
+                )?;
+                struct MessageNoMark<'a>(&'a ErrorImpl);
+                impl<'a> Display for MessageNoMark<'a> {
+                    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                        self.0.message_no_mark(f)
+                    }
+                }
+                let msg = MessageNoMark(inner).to_string();
+                Debug::fmt(&msg, f)?;
+                if let Some(mark) = inner.mark() {
+                    write!(
+                        f,
+                        ", line: {}, column: {}",
+                        mark.line() + 1,
+                        mark.column() + 1,
+                    )?;
+                }
+                f.write_str(")")
+            }
             ErrorImpl::Shared(err) => err.debug(f),
             _ => {
                 f.write_str("Error(")?;

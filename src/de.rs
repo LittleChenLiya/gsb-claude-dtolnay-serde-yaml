@@ -1844,3 +1844,196 @@ where
 {
     T::deserialize(Deserializer::from_slice(v))
 }
+
+/// A deserializer handed to one target closure of
+/// [`from_str_documents`].
+///
+/// It is the same single-document [`Deserializer`] produced by iterating a
+/// multi-document stream; pass it to `T::deserialize` to read the document
+/// into the target type chosen by that closure.
+pub struct DeserializerFromDoc<'de> {
+    inner: Deserializer<'de>,
+    range: std::ops::Range<usize>,
+}
+
+impl<'de> DeserializerFromDoc<'de> {
+    /// Byte range occupied by this document in the input string.
+    pub fn range(&self) -> std::ops::Range<usize> {
+        self.range.clone()
+    }
+}
+
+macro_rules! forward_to_document {
+    ($($method:ident $(($($arg:ident: $argty:ty),*))?;)*) => {
+        $(
+            #[inline]
+            fn $method<V>(self, $($($arg: $argty,)*)? visitor: V) -> Result<V::Value>
+            where
+                V: Visitor<'de>,
+            {
+                self.inner.$method($($($arg,)*)? visitor)
+            }
+        )*
+    };
+}
+
+impl<'de> de::Deserializer<'de> for DeserializerFromDoc<'de> {
+    type Error = Error;
+
+    #[inline]
+    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        self.inner.deserialize_any(visitor)
+    }
+
+    forward_to_document! {
+        deserialize_bool;
+        deserialize_i8;
+        deserialize_i16;
+        deserialize_i32;
+        deserialize_i64;
+        deserialize_i128;
+        deserialize_u8;
+        deserialize_u16;
+        deserialize_u32;
+        deserialize_u64;
+        deserialize_u128;
+        deserialize_f32;
+        deserialize_f64;
+        deserialize_char;
+        deserialize_str;
+        deserialize_string;
+        deserialize_bytes;
+        deserialize_byte_buf;
+        deserialize_option;
+        deserialize_unit;
+        deserialize_unit_struct(name: &'static str);
+        deserialize_newtype_struct(name: &'static str);
+        deserialize_seq;
+        deserialize_tuple(len: usize);
+        deserialize_tuple_struct(name: &'static str, len: usize);
+        deserialize_map;
+        deserialize_struct(name: &'static str, fields: &'static [&'static str]);
+        deserialize_enum(name: &'static str, variants: &'static [&'static str]);
+        deserialize_identifier;
+        deserialize_ignored_any;
+    }
+}
+
+/// Deserialize each YAML document of `s` with its own registered target.
+///
+/// Unlike [`from_str`], which treats its input as exactly one YAML document,
+/// this function consumes a stream containing several `---`-separated
+/// documents and reads each document independently with the corresponding
+/// entry of `targets`. The number of documents in the input must be exactly
+/// equal to the number of registered targets: a missing document produces a
+/// [`MissingDocuments`](crate::Error) failure and an unexpected extra document
+/// is rejected without invoking any target for it.
+///
+/// Each target is a closure receiving a single-document
+/// [`DeserializerFromDoc`] and returning the result of deserializing that
+/// document into whatever type the closure chooses. Tag resolution, anchors,
+/// and aliases are scoped to a single document, so state from an earlier
+/// document can never leak into a later one. Targets that have not been
+/// reached yet are never invoked, even if an earlier document fails.
+///
+/// A failure while reading or deserializing document *n* is attributed to that
+/// document: the error keeps the 1-based document number and the byte range
+/// the document occupied in the input, retrievable through
+/// [`Error::document`](crate::Error::document). A successful first document
+/// never makes the whole stream succeed on its own.
+///
+/// An empty document (for example a bare `---\n...`) is presented to its
+/// target as YAML `null`, exactly like an empty input is for [`from_str`].
+///
+/// # Examples
+///
+/// ```
+/// use serde::de::Deserialize as _;
+/// use serde_yaml::Value;
+///
+/// let input = "---\nname: Ada\n---\nx: 1\ny: 2\n";
+///
+/// let mut first = Value::Null;
+/// let mut second = Value::Null;
+/// serde_yaml::from_str_documents(
+///     input,
+///     &mut [
+///         &mut |de| {
+///             first = Value::deserialize(de)?;
+///             Ok(())
+///         },
+///         &mut |de| {
+///             second = Value::deserialize(de)?;
+///             Ok(())
+///         },
+///     ],
+/// )?;
+///
+/// assert_eq!(first["name"].as_str(), Some("Ada"));
+/// assert_eq!(second["x"].as_i64(), Some(1));
+/// # Ok::<(), serde_yaml::Error>(())
+/// ```
+pub fn from_str_documents<'de>(
+    s: &'de str,
+    targets: &mut [&mut dyn for<'document> FnMut(DeserializerFromDoc<'de>) -> Result<()>],
+) -> Result<()> {
+    let mut loader = Loader::new(Progress::Str(s))?;
+    let total_targets = targets.len();
+    let mut number = 0usize;
+
+    while let Some(mut document) = loader.next_document() {
+        number += 1;
+
+        let range = document.start_index as usize..document.end_index as usize;
+
+        // Every empty document is presented to its target as YAML null, per
+        // the declared null policy. The loader only synthesizes a Void event
+        // for the first document of the whole stream, so do it here for the
+        // remaining empty documents too.
+        if document.events.is_empty() {
+            document
+                .events
+                .push((Event::Void, Mark::at(range.start as u64)));
+        }
+
+        if number - 1 >= total_targets {
+            // No target registered for this document; never run a user
+            // Deserialize for an unselected document.
+            return Err(error::new(ErrorImpl::UnexpectedDocument(
+                number,
+                total_targets,
+                range,
+            )));
+        }
+
+        let document_de = DeserializerFromDoc {
+            inner: Deserializer {
+                progress: Progress::Document(document),
+            },
+            range: range.clone(),
+        };
+
+        match targets[number - 1](document_de) {
+            Ok(()) => {}
+            Err(inner) => {
+                return Err(error::new(ErrorImpl::Document(
+                    number,
+                    range,
+                    inner.shared(),
+                )));
+            }
+        }
+    }
+
+    if number < total_targets {
+        Err(error::new(ErrorImpl::MissingDocuments(
+            number,
+            total_targets,
+        )))
+    } else {
+        Ok(())
+    }
+}

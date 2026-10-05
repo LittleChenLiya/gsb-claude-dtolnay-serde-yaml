@@ -120,6 +120,13 @@ pub(crate) struct Mark {
 }
 
 impl Mark {
+    /// Builds a mark positioned at a byte index with no line/column info.
+    pub fn at(index: u64) -> Self {
+        let mut sys = unsafe { MaybeUninit::<sys::yaml_mark_t>::zeroed().assume_init() };
+        sys.index = index;
+        Mark { sys }
+    }
+
     pub fn index(&self) -> u64 {
         self.sys.index
     }

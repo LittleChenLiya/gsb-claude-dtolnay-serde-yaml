@@ -16,6 +16,11 @@ pub(crate) struct Document<'input> {
     pub error: Option<Arc<ErrorImpl>>,
     /// Map from alias id to index in events.
     pub aliases: BTreeMap<usize, usize>,
+    /// Byte index in the input at which this document begins.
+    pub start_index: u64,
+    /// Byte index in the input at which this document ends (exclusive-ish,
+    /// pointing at the document end marker or the start of the next one).
+    pub end_index: u64,
 }
 
 impl<'input> Loader<'input> {
@@ -54,16 +59,28 @@ impl<'input> Loader<'input> {
             events: Vec::new(),
             error: None,
             aliases: BTreeMap::new(),
+            start_index: 0,
+            end_index: 0,
         };
+
+        // The start index is recorded on the first event that is not the
+        // stream start, so that each document can report its own input range.
+        let mut have_start = false;
 
         loop {
             let (event, mark) = match parser.next() {
                 Ok((event, mark)) => (event, mark),
                 Err(err) => {
+                    document.end_index = err.mark().index();
                     document.error = Some(Error::from(err).shared());
                     return Some(document);
                 }
             };
+            if !have_start {
+                document.start_index = mark.index();
+                have_start = true;
+            }
+            document.end_index = mark.index();
             let event = match event {
                 YamlEvent::StreamStart => continue,
                 YamlEvent::StreamEnd => {
