@@ -117,6 +117,10 @@
 
 #![doc(html_root_url = "https://docs.rs/serde_yaml/0.9.34+deprecated")]
 #![deny(missing_docs, unsafe_op_in_unsafe_fn)]
+// The unsafe-libyaml style of raw pointer field reads trips this lint, which
+// newer compilers deny by default. The pointer reads here are long-standing
+// and audited, so keep the legacy code compiling as-is.
+#![allow(dangerous_implicit_autorefs)]
 // Suppressed clippy_pedantic lints
 #![allow(
     // buggy
@@ -161,6 +165,7 @@
 )]
 
 pub use crate::de::{from_reader, from_slice, from_str, Deserializer};
+pub use crate::documents::{DocumentError, DocumentErrorKind, Documents, NullPolicy};
 pub use crate::error::{Error, Location, Result};
 pub use crate::ser::{to_string, to_writer, Serializer};
 #[doc(inline)]
@@ -170,6 +175,7 @@ pub use crate::value::{from_value, to_value, Index, Number, Sequence, Value};
 pub use crate::mapping::Mapping;
 
 mod de;
+mod documents;
 mod error;
 mod libyaml;
 mod loader;

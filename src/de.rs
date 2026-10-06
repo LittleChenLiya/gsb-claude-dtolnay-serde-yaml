@@ -94,6 +94,11 @@ impl<'de> Deserializer<'de> {
         Deserializer { progress }
     }
 
+    pub(crate) fn from_document(document: Document<'de>) -> Self {
+        let progress = Progress::Document(document);
+        Deserializer { progress }
+    }
+
     fn de<T>(
         self,
         f: impl for<'document> FnOnce(&mut DeserializerFromEvents<'de, 'document>) -> Result<T>,
