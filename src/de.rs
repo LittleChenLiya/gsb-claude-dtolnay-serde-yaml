@@ -1,9 +1,10 @@
-use crate::error::{self, Error, ErrorImpl};
+use crate::error::{self, AliasMarks, Error, ErrorImpl, Location};
 use crate::libyaml::error::Mark;
 use crate::libyaml::parser::{MappingStart, Scalar, ScalarStyle, SequenceStart};
 use crate::libyaml::tag::Tag;
 use crate::loader::{Document, Loader};
 use crate::path::Path;
+use crate::report::{AliasPositions, NodeKind, TypeReporter, TypeSource};
 use serde::de::value::StrDeserializer;
 use serde::de::{
     self, Deserialize, DeserializeOwned, DeserializeSeed, Expected, IgnoredAny, Unexpected, Visitor,
@@ -57,6 +58,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 /// ```
 pub struct Deserializer<'de> {
     progress: Progress<'de>,
+    reporter: Option<TypeReporter>,
 }
 
 pub(crate) enum Progress<'de> {
@@ -72,13 +74,19 @@ impl<'de> Deserializer<'de> {
     /// Creates a YAML deserializer from a `&str`.
     pub fn from_str(s: &'de str) -> Self {
         let progress = Progress::Str(s);
-        Deserializer { progress }
+        Deserializer {
+            progress,
+            reporter: None,
+        }
     }
 
     /// Creates a YAML deserializer from a `&[u8]`.
     pub fn from_slice(v: &'de [u8]) -> Self {
         let progress = Progress::Slice(v);
-        Deserializer { progress }
+        Deserializer {
+            progress,
+            reporter: None,
+        }
     }
 
     /// Creates a YAML deserializer from an `io::Read`.
@@ -91,7 +99,24 @@ impl<'de> Deserializer<'de> {
         R: io::Read + 'de,
     {
         let progress = Progress::Read(Box::new(rdr));
-        Deserializer { progress }
+        Deserializer {
+            progress,
+            reporter: None,
+        }
+    }
+
+    /// Enables explicit type-source reporting on this deserializer.
+    ///
+    /// While deserializing, every scalar, sequence, mapping or explicit
+    /// `!tag` node that is actually encountered is recorded into the given
+    /// reporter together with the expected type and the node's position; see
+    /// the [`report`][crate::report] module. Recording happens during the
+    /// single normal deserialization pass, so the `Deserialize`
+    /// implementation being driven is executed exactly once and the
+    /// deserializer's ordinary `Result` is unaffected.
+    pub fn with_type_reporter(mut self, reporter: &TypeReporter) -> Self {
+        self.reporter = Some(reporter.clone());
+        self
     }
 
     fn de<T>(
@@ -100,8 +125,9 @@ impl<'de> Deserializer<'de> {
     ) -> Result<T> {
         let mut pos = 0;
         let mut jumpcount = 0;
+        let Deserializer { progress, reporter } = self;
 
-        match self.progress {
+        match progress {
             Progress::Iterable(_) => return Err(error::new(ErrorImpl::MoreThanOneDocument)),
             Progress::Document(document) => {
                 let t = f(&mut DeserializerFromEvents {
@@ -111,6 +137,8 @@ impl<'de> Deserializer<'de> {
                     path: Path::Root,
                     remaining_depth: 128,
                     current_enum: None,
+                    reporter,
+                    alias: None,
                 })?;
                 if let Some(parse_error) = document.error {
                     return Err(error::shared(parse_error));
@@ -120,7 +148,7 @@ impl<'de> Deserializer<'de> {
             _ => {}
         }
 
-        let mut loader = Loader::new(self.progress)?;
+        let mut loader = Loader::new(progress)?;
         let document = match loader.next_document() {
             Some(document) => document,
             None => return Err(error::new(ErrorImpl::EndOfStream)),
@@ -132,6 +160,8 @@ impl<'de> Deserializer<'de> {
             path: Path::Root,
             remaining_depth: 128,
             current_enum: None,
+            reporter,
+            alias: None,
         })?;
         if let Some(parse_error) = document.error {
             return Err(error::shared(parse_error));
@@ -153,12 +183,14 @@ impl<'de> Iterator for Deserializer<'de> {
                 let document = loader.next_document()?;
                 return Some(Deserializer {
                     progress: Progress::Document(document),
+                    reporter: self.reporter.clone(),
                 });
             }
             Progress::Document(_) => return None,
             Progress::Fail(err) => {
                 return Some(Deserializer {
                     progress: Progress::Fail(Arc::clone(err)),
+                    reporter: self.reporter.clone(),
                 });
             }
             _ => {}
@@ -176,6 +208,7 @@ impl<'de> Iterator for Deserializer<'de> {
                 self.progress = Progress::Fail(Arc::clone(&fail));
                 Some(Deserializer {
                     progress: Progress::Fail(fail),
+                    reporter: self.reporter.clone(),
                 })
             }
         }
@@ -436,6 +469,8 @@ struct DeserializerFromEvents<'de, 'document> {
     path: Path<'document>,
     remaining_depth: u8,
     current_enum: Option<CurrentEnum<'document>>,
+    reporter: Option<TypeReporter>,
+    alias: Option<AliasMarks>,
 }
 
 #[derive(Copy, Clone)]
@@ -474,6 +509,7 @@ impl<'de, 'document> DeserializerFromEvents<'de, 'document> {
     fn jump<'anchor>(
         &'anchor mut self,
         pos: &'anchor mut usize,
+        reference: Mark,
     ) -> Result<DeserializerFromEvents<'de, 'anchor>> {
         *self.jumpcount += 1;
         if *self.jumpcount > self.document.events.len() * 100 {
@@ -481,6 +517,7 @@ impl<'de, 'document> DeserializerFromEvents<'de, 'document> {
         }
         match self.document.aliases.get(pos) {
             Some(found) => {
+                let definition = self.document.events[*found].1;
                 *pos = *found;
                 Ok(DeserializerFromEvents {
                     document: self.document,
@@ -489,9 +526,63 @@ impl<'de, 'document> DeserializerFromEvents<'de, 'document> {
                     path: Path::Alias { parent: &self.path },
                     remaining_depth: self.remaining_depth,
                     current_enum: None,
+                    reporter: self.reporter.clone(),
+                    alias: Some(AliasMarks {
+                        definition,
+                        reference,
+                    }),
                 })
             }
             None => panic!("unresolved alias: {}", *pos),
+        }
+    }
+
+    /// Records one type-source entry for the encountered node, if a reporter
+    /// is attached. Alias events themselves are not recorded here; the node
+    /// they resolve to is recorded by the jumped-to deserializer, annotated
+    /// with both the definition and reference positions of the alias.
+    fn record<V>(&self, event: &Event<'de>, mark: Mark, visitor: &V)
+    where
+        V: Visitor<'de>,
+    {
+        let reporter = match &self.reporter {
+            Some(reporter) => reporter,
+            None => return,
+        };
+        let (node, tagged) = match event {
+            Event::Scalar(scalar) => (NodeKind::Scalar, scalar.tag.is_some()),
+            Event::SequenceStart(sequence) => (NodeKind::Sequence, sequence.tag.is_some()),
+            Event::MappingStart(mapping) => (NodeKind::Mapping, mapping.tag.is_some()),
+            _ => return,
+        };
+        let expected = {
+            struct AsExpected<'a, V>(&'a V);
+            impl<'a, 'de, V> fmt::Display for AsExpected<'a, V>
+            where
+                V: Visitor<'de>,
+            {
+                fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                    self.0.expecting(formatter)
+                }
+            }
+            AsExpected(visitor).to_string()
+        };
+        // A zero mark carries no position information. Report it as unknown
+        // rather than fabricating a line 0.
+        let location = if mark.line() == 0 && mark.column() == 0 {
+            None
+        } else {
+            Some(Location::from_mark(mark))
+        };
+        let alias = self.alias.map(|marks| {
+            AliasPositions::new(
+                Location::from_mark(marks.definition),
+                Location::from_mark(marks.reference),
+            )
+        });
+        reporter.push(TypeSource::new(expected.clone(), node, location, alias));
+        if tagged {
+            reporter.push(TypeSource::new(expected, NodeKind::Tag, location, alias));
         }
     }
 
@@ -674,6 +765,8 @@ impl<'de, 'document, 'seq> de::SeqAccess<'de> for SeqAccess<'de, 'document, 'seq
                     },
                     remaining_depth: self.de.remaining_depth,
                     current_enum: None,
+                    reporter: self.de.reporter.clone(),
+                    alias: None,
                 };
                 self.len += 1;
                 seed.deserialize(&mut element_de).map(Some)
@@ -734,6 +827,8 @@ impl<'de, 'document, 'map> de::MapAccess<'de> for MapAccess<'de, 'document, 'map
             },
             remaining_depth: self.de.remaining_depth,
             current_enum: None,
+            reporter: self.de.reporter.clone(),
+            alias: None,
         };
         seed.deserialize(&mut value_de)
     }
@@ -765,6 +860,8 @@ impl<'de, 'document, 'variant> de::EnumAccess<'de> for EnumAccess<'de, 'document
                 name: self.name,
                 tag: self.tag,
             }),
+            reporter: self.de.reporter.clone(),
+            alias: None,
         };
         Ok((variant, visitor))
     }
@@ -1211,6 +1308,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
     {
         let tagged_already = self.current_enum.is_some();
         let (next, mark) = self.next_event_mark()?;
+        self.record(next, mark, &visitor);
         fn enum_tag(tag: &Option<Tag>, tagged_already: bool) -> Option<&str> {
             if tagged_already {
                 return None;
@@ -1219,7 +1317,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
         }
         loop {
             match next {
-                Event::Alias(mut pos) => break self.jump(&mut pos)?.deserialize_any(visitor),
+                Event::Alias(mut pos) => break self.jump(&mut pos, mark)?.deserialize_any(visitor),
                 Event::Scalar(scalar) => {
                     if let Some(tag) = enum_tag(&scalar.tag, tagged_already) {
                         *self.pos -= 1;
@@ -1260,7 +1358,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
         }
         // The de::Error impl creates errors with unknown line and column. Fill
         // in the position here by looking at the current index in the input.
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, self.alias))
     }
 
     fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value>
@@ -1269,9 +1367,10 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
     {
         let tagged_already = self.current_enum.is_some();
         let (next, mark) = self.next_event_mark()?;
+        self.record(next, mark, &visitor);
         loop {
             match next {
-                Event::Alias(mut pos) => break self.jump(&mut pos)?.deserialize_bool(visitor),
+                Event::Alias(mut pos) => break self.jump(&mut pos, mark)?.deserialize_bool(visitor),
                 Event::Scalar(scalar)
                     if is_plain_or_tagged_literal_scalar(Tag::BOOL, scalar, tagged_already) =>
                 {
@@ -1285,7 +1384,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
             }
             break Err(invalid_type(next, &visitor));
         }
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, self.alias))
     }
 
     fn deserialize_i8<V>(self, visitor: V) -> Result<V::Value>
@@ -1315,9 +1414,10 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
     {
         let tagged_already = self.current_enum.is_some();
         let (next, mark) = self.next_event_mark()?;
+        self.record(next, mark, &visitor);
         loop {
             match next {
-                Event::Alias(mut pos) => break self.jump(&mut pos)?.deserialize_i64(visitor),
+                Event::Alias(mut pos) => break self.jump(&mut pos, mark)?.deserialize_i64(visitor),
                 Event::Scalar(scalar)
                     if is_plain_or_tagged_literal_scalar(Tag::INT, scalar, tagged_already) =>
                 {
@@ -1331,7 +1431,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
             }
             break Err(invalid_type(next, &visitor));
         }
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, self.alias))
     }
 
     fn deserialize_i128<V>(self, visitor: V) -> Result<V::Value>
@@ -1340,9 +1440,10 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
     {
         let tagged_already = self.current_enum.is_some();
         let (next, mark) = self.next_event_mark()?;
+        self.record(next, mark, &visitor);
         loop {
             match next {
-                Event::Alias(mut pos) => break self.jump(&mut pos)?.deserialize_i128(visitor),
+                Event::Alias(mut pos) => break self.jump(&mut pos, mark)?.deserialize_i128(visitor),
                 Event::Scalar(scalar)
                     if is_plain_or_tagged_literal_scalar(Tag::INT, scalar, tagged_already) =>
                 {
@@ -1356,7 +1457,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
             }
             break Err(invalid_type(next, &visitor));
         }
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, self.alias))
     }
 
     fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value>
@@ -1386,9 +1487,10 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
     {
         let tagged_already = self.current_enum.is_some();
         let (next, mark) = self.next_event_mark()?;
+        self.record(next, mark, &visitor);
         loop {
             match next {
-                Event::Alias(mut pos) => break self.jump(&mut pos)?.deserialize_u64(visitor),
+                Event::Alias(mut pos) => break self.jump(&mut pos, mark)?.deserialize_u64(visitor),
                 Event::Scalar(scalar)
                     if is_plain_or_tagged_literal_scalar(Tag::INT, scalar, tagged_already) =>
                 {
@@ -1402,7 +1504,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
             }
             break Err(invalid_type(next, &visitor));
         }
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, self.alias))
     }
 
     fn deserialize_u128<V>(self, visitor: V) -> Result<V::Value>
@@ -1411,9 +1513,10 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
     {
         let tagged_already = self.current_enum.is_some();
         let (next, mark) = self.next_event_mark()?;
+        self.record(next, mark, &visitor);
         loop {
             match next {
-                Event::Alias(mut pos) => break self.jump(&mut pos)?.deserialize_u128(visitor),
+                Event::Alias(mut pos) => break self.jump(&mut pos, mark)?.deserialize_u128(visitor),
                 Event::Scalar(scalar)
                     if is_plain_or_tagged_literal_scalar(Tag::INT, scalar, tagged_already) =>
                 {
@@ -1427,7 +1530,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
             }
             break Err(invalid_type(next, &visitor));
         }
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, self.alias))
     }
 
     fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value>
@@ -1443,9 +1546,10 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
     {
         let tagged_already = self.current_enum.is_some();
         let (next, mark) = self.next_event_mark()?;
+        self.record(next, mark, &visitor);
         loop {
             match next {
-                Event::Alias(mut pos) => break self.jump(&mut pos)?.deserialize_f64(visitor),
+                Event::Alias(mut pos) => break self.jump(&mut pos, mark)?.deserialize_f64(visitor),
                 Event::Scalar(scalar)
                     if is_plain_or_tagged_literal_scalar(Tag::FLOAT, scalar, tagged_already) =>
                 {
@@ -1459,7 +1563,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
             }
             break Err(invalid_type(next, &visitor));
         }
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, self.alias))
     }
 
     fn deserialize_char<V>(self, visitor: V) -> Result<V::Value>
@@ -1474,6 +1578,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
         V: Visitor<'de>,
     {
         let (next, mark) = self.next_event_mark()?;
+        self.record(next, mark, &visitor);
         match next {
             Event::Scalar(scalar) => {
                 if let Ok(v) = str::from_utf8(&scalar.value) {
@@ -1486,10 +1591,10 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
                     Err(invalid_type(next, &visitor))
                 }
             }
-            Event::Alias(mut pos) => self.jump(&mut pos)?.deserialize_str(visitor),
+            Event::Alias(mut pos) => self.jump(&mut pos, mark)?.deserialize_str(visitor),
             other => Err(invalid_type(other, &visitor)),
         }
-        .map_err(|err: Error| error::fix_mark(err, mark, self.path))
+        .map_err(|err: Error| error::fix_mark(err, mark, self.path, self.alias))
     }
 
     fn deserialize_string<V>(self, visitor: V) -> Result<V::Value>
@@ -1518,10 +1623,12 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
     where
         V: Visitor<'de>,
     {
-        let is_some = match self.peek_event()? {
+        let (next, mark) = self.peek_event_mark()?;
+        self.record(next, mark, &visitor);
+        let is_some = match next {
             Event::Alias(mut pos) => {
                 *self.pos += 1;
-                return self.jump(&mut pos)?.deserialize_option(visitor);
+                return self.jump(&mut pos, mark)?.deserialize_option(visitor);
             }
             Event::Scalar(scalar) => {
                 let tagged_already = self.current_enum.is_some();
@@ -1566,6 +1673,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
     {
         let tagged_already = self.current_enum.is_some();
         let (next, mark) = self.next_event_mark()?;
+        self.record(next, mark, &visitor);
         match next {
             Event::Scalar(scalar) => {
                 let is_null = if scalar.style != ScalarStyle::Plain {
@@ -1586,11 +1694,11 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
                     ))
                 }
             }
-            Event::Alias(mut pos) => self.jump(&mut pos)?.deserialize_unit(visitor),
+            Event::Alias(mut pos) => self.jump(&mut pos, mark)?.deserialize_unit(visitor),
             Event::Void => visitor.visit_unit(),
             other => Err(invalid_type(other, &visitor)),
         }
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, self.alias))
     }
 
     fn deserialize_unit_struct<V>(self, _name: &'static str, visitor: V) -> Result<V::Value>
@@ -1614,8 +1722,9 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
         V: Visitor<'de>,
     {
         let (next, mark) = self.next_event_mark()?;
+        self.record(next, mark, &visitor);
         match next {
-            Event::Alias(mut pos) => self.jump(&mut pos)?.deserialize_seq(visitor),
+            Event::Alias(mut pos) => self.jump(&mut pos, mark)?.deserialize_seq(visitor),
             Event::SequenceStart(_) => self.visit_sequence(visitor, mark),
             other => {
                 if match other {
@@ -1635,7 +1744,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
                 }
             }
         }
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, self.alias))
     }
 
     fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value>
@@ -1662,8 +1771,9 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
         V: Visitor<'de>,
     {
         let (next, mark) = self.next_event_mark()?;
+        self.record(next, mark, &visitor);
         match next {
-            Event::Alias(mut pos) => self.jump(&mut pos)?.deserialize_map(visitor),
+            Event::Alias(mut pos) => self.jump(&mut pos, mark)?.deserialize_map(visitor),
             Event::MappingStart(_) => self.visit_mapping(visitor, mark),
             other => {
                 if match other {
@@ -1684,7 +1794,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
                 }
             }
         }
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, self.alias))
     }
 
     fn deserialize_struct<V>(
@@ -1712,6 +1822,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
         V: Visitor<'de>,
     {
         let (next, mark) = self.peek_event_mark()?;
+        self.record(next, mark, &visitor);
         loop {
             if let Some(current_enum) = self.current_enum {
                 if let Event::Scalar(scalar) = next {
@@ -1735,7 +1846,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
             break match next {
                 Event::Alias(mut pos) => {
                     *self.pos += 1;
-                    self.jump(&mut pos)?
+                    self.jump(&mut pos, mark)?
                         .deserialize_enum(name, variants, visitor)
                 }
                 Event::Scalar(scalar) => {
@@ -1758,7 +1869,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
                     }
                     let err =
                         de::Error::invalid_type(Unexpected::Map, &"a YAML tag starting with '!'");
-                    Err(error::fix_mark(err, mark, self.path))
+                    Err(error::fix_mark(err, mark, self.path, self.alias))
                 }
                 Event::SequenceStart(sequence) => {
                     if let Some(tag) = parse_tag(&sequence.tag) {
@@ -1770,14 +1881,14 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
                     }
                     let err =
                         de::Error::invalid_type(Unexpected::Seq, &"a YAML tag starting with '!'");
-                    Err(error::fix_mark(err, mark, self.path))
+                    Err(error::fix_mark(err, mark, self.path, self.alias))
                 }
                 Event::SequenceEnd => panic!("unexpected end of sequence"),
                 Event::MappingEnd => panic!("unexpected end of mapping"),
                 Event::Void => Err(error::new(ErrorImpl::EndOfStream)),
             };
         }
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, self.alias))
     }
 
     fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value>

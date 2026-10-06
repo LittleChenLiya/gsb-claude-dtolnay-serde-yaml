@@ -43,10 +43,19 @@ pub(crate) enum ErrorImpl {
 pub(crate) struct Pos {
     mark: libyaml::Mark,
     path: String,
+    alias: Option<AliasMarks>,
+}
+
+/// The positions involved when an error is reached through a YAML alias: the
+/// mark of the anchored definition and the mark of the alias reference.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct AliasMarks {
+    pub definition: libyaml::Mark,
+    pub reference: libyaml::Mark,
 }
 
 /// The input location that an error occured.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Location {
     index: usize,
     line: usize,
@@ -71,7 +80,7 @@ impl Location {
 
     // This is to keep decoupled with the yaml crate
     #[doc(hidden)]
-    fn from_mark(mark: libyaml::Mark) -> Self {
+    pub(crate) fn from_mark(mark: libyaml::Mark) -> Self {
         Location {
             index: mark.index() as usize,
             // `line` and `column` returned from libyaml are 0-indexed but all error messages add +1 to this value
@@ -112,11 +121,17 @@ pub(crate) fn shared(shared: Arc<ErrorImpl>) -> Error {
     Error(Box::new(ErrorImpl::Shared(shared)))
 }
 
-pub(crate) fn fix_mark(mut error: Error, mark: libyaml::Mark, path: Path) -> Error {
+pub(crate) fn fix_mark(
+    mut error: Error,
+    mark: libyaml::Mark,
+    path: Path,
+    alias: Option<AliasMarks>,
+) -> Error {
     if let ErrorImpl::Message(_, none @ None) = error.0.as_mut() {
         *none = Some(Pos {
             mark,
             path: path.to_string(),
+            alias,
         });
     }
     error
@@ -195,7 +210,7 @@ impl ErrorImpl {
 
     fn mark(&self) -> Option<libyaml::Mark> {
         match self {
-            ErrorImpl::Message(_, Some(Pos { mark, path: _ }))
+            ErrorImpl::Message(_, Some(Pos { mark, .. }))
             | ErrorImpl::RecursionLimitExceeded(mark)
             | ErrorImpl::UnknownAnchor(mark) => Some(*mark),
             ErrorImpl::Libyaml(err) => Some(err.mark()),
@@ -207,7 +222,7 @@ impl ErrorImpl {
     fn message_no_mark(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ErrorImpl::Message(msg, None) => f.write_str(msg),
-            ErrorImpl::Message(msg, Some(Pos { mark: _, path })) => {
+            ErrorImpl::Message(msg, Some(Pos { mark: _, path, .. })) => {
                 if path != "." {
                     write!(f, "{}: ", path)?;
                 }
@@ -255,6 +270,20 @@ impl ErrorImpl {
                     if mark.line() != 0 || mark.column() != 0 {
                         write!(f, " at {}", mark)?;
                     }
+                }
+                if let ErrorImpl::Message(
+                    _,
+                    Some(Pos {
+                        alias: Some(alias),
+                        ..
+                    }),
+                ) = self
+                {
+                    write!(
+                        f,
+                        " (alias defined at {}, referenced at {})",
+                        alias.definition, alias.reference,
+                    )?;
                 }
                 Ok(())
             }
