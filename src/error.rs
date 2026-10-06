@@ -17,6 +17,7 @@ pub type Result<T> = result::Result<T, Error>;
 #[derive(Debug)]
 pub(crate) enum ErrorImpl {
     Message(String, Option<Pos>),
+    TypeMismatch(Box<TypeMismatchImpl>),
 
     Libyaml(libyaml::Error),
     Io(io::Error),
@@ -43,10 +44,109 @@ pub(crate) enum ErrorImpl {
 pub(crate) struct Pos {
     mark: libyaml::Mark,
     path: String,
+    /// Position of the alias reference through which the node at `mark` was
+    /// reached, if any.
+    alias: Option<libyaml::Mark>,
+}
+
+/// A type mismatch between the YAML node encountered during deserialization
+/// and the type expected by the `Deserialize` implementation.
+#[derive(Debug)]
+pub(crate) struct TypeMismatchImpl {
+    /// The full error message, rendered the same way serde renders
+    /// `invalid_type` errors.
+    pub(crate) msg: String,
+    /// Description of the expected type, like `i64`.
+    pub(crate) expected: String,
+    /// The kind of YAML node that was found instead.
+    pub(crate) found: NodeKind,
+    pub(crate) pos: Option<Pos>,
+}
+
+/// The kind of YAML node that was encountered at a position where the
+/// `Deserialize` implementation expected a different type.
+///
+/// Returned by [`TypeSource::found`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeKind {
+    /// A plain scalar node.
+    Scalar,
+    /// A sequence node.
+    Sequence,
+    /// A mapping node.
+    Mapping,
+    /// A node carrying an explicit YAML tag.
+    Tagged,
+}
+
+/// An explicit report of where a deserialization type mismatch came from:
+/// the expected type, the kind and position of the YAML node that was found
+/// instead, and—when that node was reached through an alias—both the alias
+/// reference position and the anchored definition position.
+///
+/// Returned by [`Error::type_source`].
+#[derive(Debug)]
+pub struct TypeSource {
+    expected: String,
+    found: NodeKind,
+    mark: Option<libyaml::Mark>,
+    alias_reference: Option<libyaml::Mark>,
+}
+
+impl TypeSource {
+    /// A description of the type expected by the `Deserialize`
+    /// implementation, like `i64` or `a boolean`.
+    pub fn expected(&self) -> &str {
+        &self.expected
+    }
+
+    /// The kind of YAML node that was found instead of the expected type.
+    pub fn found(&self) -> NodeKind {
+        self.found
+    }
+
+    /// The position of the YAML node that did not match the expected type.
+    ///
+    /// When the node was reached through an alias, this is the position of
+    /// the anchored definition. Not all errors have a position.
+    pub fn location(&self) -> Option<Location> {
+        self.mark.map(Location::from_mark)
+    }
+
+    /// If the mismatched node was reached through an alias, the positions of
+    /// both the alias reference and the anchored definition.
+    pub fn alias(&self) -> Option<AliasLocations> {
+        Some(AliasLocations {
+            reference: Location::from_mark(self.alias_reference?),
+            definition: Location::from_mark(self.mark?),
+        })
+    }
+}
+
+/// The two positions involved in following a YAML alias: where the alias
+/// was referenced and where the anchored node was defined.
+///
+/// Returned by [`TypeSource::alias`].
+#[derive(Debug, Clone, Copy)]
+pub struct AliasLocations {
+    reference: Location,
+    definition: Location,
+}
+
+impl AliasLocations {
+    /// The position of the alias reference (`*name`) in the input.
+    pub fn reference(&self) -> Location {
+        self.reference
+    }
+
+    /// The position of the anchored node definition (`&name`) in the input.
+    pub fn definition(&self) -> Location {
+        self.definition
+    }
 }
 
 /// The input location that an error occured.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Location {
     index: usize,
     line: usize,
@@ -102,6 +202,39 @@ impl Error {
     pub fn location(&self) -> Option<Location> {
         self.0.location()
     }
+
+    /// If this error is a type mismatch between the YAML document and the
+    /// type expected by the `Deserialize` implementation, returns an
+    /// explicit report of the expected type and of the kind and position of
+    /// the YAML node that was found instead.
+    ///
+    /// When the mismatched node was reached through a YAML alias, the report
+    /// carries both the position of the alias reference and the position of
+    /// the anchored definition; see [`TypeSource::alias`].
+    ///
+    /// The report is produced during the single deserialization pass that
+    /// encountered the mismatch; the input is never deserialized a second
+    /// time to reconstruct it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use serde_derive::Deserialize;
+    /// # use serde_yaml::NodeKind;
+    /// #[derive(Debug, Deserialize)]
+    /// struct S {
+    ///     x: i64,
+    /// }
+    ///
+    /// let err = serde_yaml::from_str::<S>("x: [1, 2]\n").unwrap_err();
+    /// let source = err.type_source().unwrap();
+    /// assert_eq!(source.expected(), "i64");
+    /// assert_eq!(source.found(), NodeKind::Sequence);
+    /// assert_eq!(source.location().unwrap().line(), 1);
+    /// ```
+    pub fn type_source(&self) -> Option<TypeSource> {
+        self.0.type_source()
+    }
 }
 
 pub(crate) fn new(inner: ErrorImpl) -> Error {
@@ -113,13 +246,52 @@ pub(crate) fn shared(shared: Arc<ErrorImpl>) -> Error {
 }
 
 pub(crate) fn fix_mark(mut error: Error, mark: libyaml::Mark, path: Path) -> Error {
-    if let ErrorImpl::Message(_, none @ None) = error.0.as_mut() {
-        *none = Some(Pos {
-            mark,
-            path: path.to_string(),
-        });
+    let pos = Pos {
+        mark,
+        path: path.to_string(),
+        alias: None,
+    };
+    match error.0.as_mut() {
+        ErrorImpl::Message(_, none @ None) => *none = Some(pos),
+        ErrorImpl::TypeMismatch(mismatch) if mismatch.pos.is_none() => mismatch.pos = Some(pos),
+        _ => {}
     }
     error
+}
+
+/// Record the position of the alias reference through which the current node
+/// was reached. The position of the (definition) node itself is kept as the
+/// primary position of the error; the alias reference is attached alongside
+/// it so that both can be reported.
+pub(crate) fn fix_alias_mark(mut error: Error, mark: libyaml::Mark) -> Error {
+    let pos = match error.0.as_mut() {
+        ErrorImpl::Message(_, pos) => pos,
+        ErrorImpl::TypeMismatch(mismatch) => &mut mismatch.pos,
+        _ => return error,
+    };
+    if let Some(pos) = pos {
+        if pos.alias.is_none() {
+            pos.alias = Some(mark);
+        }
+    }
+    error
+}
+
+/// Turn an `invalid_type` error produced by serde into an explicit
+/// `TypeMismatch` that records the expected type and the kind of YAML node
+/// that was found, keeping the original message unchanged.
+pub(crate) fn type_mismatch(err: Error, expected: String, found: NodeKind) -> Error {
+    match *err.0 {
+        ErrorImpl::Message(msg, None) => Error(Box::new(ErrorImpl::TypeMismatch(Box::new(
+            TypeMismatchImpl {
+                msg,
+                expected,
+                found,
+                pos: None,
+            },
+        )))),
+        other => Error(Box::new(other)),
+    }
 }
 
 impl Error {
@@ -184,6 +356,19 @@ impl ErrorImpl {
         self.mark().map(Location::from_mark)
     }
 
+    fn type_source(&self) -> Option<TypeSource> {
+        match self {
+            ErrorImpl::TypeMismatch(mismatch) => Some(TypeSource {
+                expected: mismatch.expected.clone(),
+                found: mismatch.found,
+                mark: mismatch.pos.as_ref().map(|pos| pos.mark),
+                alias_reference: mismatch.pos.as_ref().and_then(|pos| pos.alias),
+            }),
+            ErrorImpl::Shared(err) => err.type_source(),
+            _ => None,
+        }
+    }
+
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             ErrorImpl::Io(err) => err.source(),
@@ -195,23 +380,43 @@ impl ErrorImpl {
 
     fn mark(&self) -> Option<libyaml::Mark> {
         match self {
-            ErrorImpl::Message(_, Some(Pos { mark, path: _ }))
+            ErrorImpl::Message(_, Some(Pos { mark, .. }))
             | ErrorImpl::RecursionLimitExceeded(mark)
             | ErrorImpl::UnknownAnchor(mark) => Some(*mark),
+            ErrorImpl::TypeMismatch(mismatch) => mismatch.pos.as_ref().map(|pos| pos.mark),
             ErrorImpl::Libyaml(err) => Some(err.mark()),
             ErrorImpl::Shared(err) => err.mark(),
             _ => None,
         }
     }
 
-    fn message_no_mark(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn alias_mark(&self) -> Option<libyaml::Mark> {
         match self {
-            ErrorImpl::Message(msg, None) => f.write_str(msg),
-            ErrorImpl::Message(msg, Some(Pos { mark: _, path })) => {
+            ErrorImpl::Message(_, Some(pos)) => pos.alias,
+            ErrorImpl::TypeMismatch(mismatch) => mismatch.pos.as_ref().and_then(|pos| pos.alias),
+            ErrorImpl::Shared(err) => err.alias_mark(),
+            _ => None,
+        }
+    }
+
+    fn message_no_mark(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fn write_path(f: &mut fmt::Formatter, pos: &Option<Pos>) -> fmt::Result {
+            if let Some(Pos { path, .. }) = pos {
                 if path != "." {
                     write!(f, "{}: ", path)?;
                 }
+            }
+            Ok(())
+        }
+
+        match self {
+            ErrorImpl::Message(msg, pos) => {
+                write_path(f, pos)?;
                 f.write_str(msg)
+            }
+            ErrorImpl::TypeMismatch(mismatch) => {
+                write_path(f, &mismatch.pos)?;
+                f.write_str(&mismatch.msg)
             }
             ErrorImpl::Libyaml(_) => unreachable!(),
             ErrorImpl::Io(err) => Display::fmt(err, f),
@@ -256,6 +461,11 @@ impl ErrorImpl {
                         write!(f, " at {}", mark)?;
                     }
                 }
+                if let Some(alias) = self.alias_mark() {
+                    if alias.line() != 0 || alias.column() != 0 {
+                        write!(f, " (referenced by alias at {})", alias)?;
+                    }
+                }
                 Ok(())
             }
         }
@@ -281,6 +491,14 @@ impl ErrorImpl {
                         ", line: {}, column: {}",
                         mark.line() + 1,
                         mark.column() + 1,
+                    )?;
+                }
+                if let Some(alias) = self.alias_mark() {
+                    write!(
+                        f,
+                        ", alias line: {}, column: {}",
+                        alias.line() + 1,
+                        alias.column() + 1,
                     )?;
                 }
                 f.write_str(")")

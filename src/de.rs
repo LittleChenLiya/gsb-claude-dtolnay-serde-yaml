@@ -1,4 +1,4 @@
-use crate::error::{self, Error, ErrorImpl};
+use crate::error::{self, Error, ErrorImpl, NodeKind};
 use crate::libyaml::error::Mark;
 use crate::libyaml::parser::{MappingStart, Scalar, ScalarStyle, SequenceStart};
 use crate::libyaml::tag::Tag;
@@ -1173,21 +1173,34 @@ fn invalid_type(event: &Event, exp: &dyn Expected) -> Error {
         }
     }
 
-    match event {
+    let (err, found) = match event {
         Event::Alias(_) => unreachable!(),
         Event::Scalar(scalar) => {
             let get_type = InvalidType { exp };
-            match visit_scalar(get_type, scalar, false) {
+            let err = match visit_scalar(get_type, scalar, false) {
                 Ok(void) => match void {},
                 Err(invalid_type) => invalid_type,
-            }
+            };
+            let found = if scalar.tag.is_some() {
+                NodeKind::Tagged
+            } else {
+                NodeKind::Scalar
+            };
+            (err, found)
         }
-        Event::SequenceStart(_) => de::Error::invalid_type(Unexpected::Seq, exp),
-        Event::MappingStart(_) => de::Error::invalid_type(Unexpected::Map, exp),
+        Event::SequenceStart(_) => (
+            de::Error::invalid_type(Unexpected::Seq, exp),
+            NodeKind::Sequence,
+        ),
+        Event::MappingStart(_) => (
+            de::Error::invalid_type(Unexpected::Map, exp),
+            NodeKind::Mapping,
+        ),
         Event::SequenceEnd => panic!("unexpected end of sequence"),
         Event::MappingEnd => panic!("unexpected end of mapping"),
-        Event::Void => error::new(ErrorImpl::EndOfStream),
-    }
+        Event::Void => return error::new(ErrorImpl::EndOfStream),
+    };
+    error::type_mismatch(err, exp.to_string(), found)
 }
 
 fn parse_tag(libyaml_tag: &Option<Tag>) -> Option<&str> {
@@ -1219,7 +1232,12 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
         }
         loop {
             match next {
-                Event::Alias(mut pos) => break self.jump(&mut pos)?.deserialize_any(visitor),
+                Event::Alias(mut pos) => {
+                    break self
+                        .jump(&mut pos)?
+                        .deserialize_any(visitor)
+                        .map_err(|err| error::fix_alias_mark(err, mark));
+                }
                 Event::Scalar(scalar) => {
                     if let Some(tag) = enum_tag(&scalar.tag, tagged_already) {
                         *self.pos -= 1;
@@ -1271,7 +1289,12 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
         let (next, mark) = self.next_event_mark()?;
         loop {
             match next {
-                Event::Alias(mut pos) => break self.jump(&mut pos)?.deserialize_bool(visitor),
+                Event::Alias(mut pos) => {
+                    break self
+                        .jump(&mut pos)?
+                        .deserialize_bool(visitor)
+                        .map_err(|err| error::fix_alias_mark(err, mark));
+                }
                 Event::Scalar(scalar)
                     if is_plain_or_tagged_literal_scalar(Tag::BOOL, scalar, tagged_already) =>
                 {
@@ -1317,7 +1340,12 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
         let (next, mark) = self.next_event_mark()?;
         loop {
             match next {
-                Event::Alias(mut pos) => break self.jump(&mut pos)?.deserialize_i64(visitor),
+                Event::Alias(mut pos) => {
+                    break self
+                        .jump(&mut pos)?
+                        .deserialize_i64(visitor)
+                        .map_err(|err| error::fix_alias_mark(err, mark));
+                }
                 Event::Scalar(scalar)
                     if is_plain_or_tagged_literal_scalar(Tag::INT, scalar, tagged_already) =>
                 {
@@ -1342,7 +1370,12 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
         let (next, mark) = self.next_event_mark()?;
         loop {
             match next {
-                Event::Alias(mut pos) => break self.jump(&mut pos)?.deserialize_i128(visitor),
+                Event::Alias(mut pos) => {
+                    break self
+                        .jump(&mut pos)?
+                        .deserialize_i128(visitor)
+                        .map_err(|err| error::fix_alias_mark(err, mark));
+                }
                 Event::Scalar(scalar)
                     if is_plain_or_tagged_literal_scalar(Tag::INT, scalar, tagged_already) =>
                 {
@@ -1388,7 +1421,12 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
         let (next, mark) = self.next_event_mark()?;
         loop {
             match next {
-                Event::Alias(mut pos) => break self.jump(&mut pos)?.deserialize_u64(visitor),
+                Event::Alias(mut pos) => {
+                    break self
+                        .jump(&mut pos)?
+                        .deserialize_u64(visitor)
+                        .map_err(|err| error::fix_alias_mark(err, mark));
+                }
                 Event::Scalar(scalar)
                     if is_plain_or_tagged_literal_scalar(Tag::INT, scalar, tagged_already) =>
                 {
@@ -1413,7 +1451,12 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
         let (next, mark) = self.next_event_mark()?;
         loop {
             match next {
-                Event::Alias(mut pos) => break self.jump(&mut pos)?.deserialize_u128(visitor),
+                Event::Alias(mut pos) => {
+                    break self
+                        .jump(&mut pos)?
+                        .deserialize_u128(visitor)
+                        .map_err(|err| error::fix_alias_mark(err, mark));
+                }
                 Event::Scalar(scalar)
                     if is_plain_or_tagged_literal_scalar(Tag::INT, scalar, tagged_already) =>
                 {
@@ -1445,7 +1488,12 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
         let (next, mark) = self.next_event_mark()?;
         loop {
             match next {
-                Event::Alias(mut pos) => break self.jump(&mut pos)?.deserialize_f64(visitor),
+                Event::Alias(mut pos) => {
+                    break self
+                        .jump(&mut pos)?
+                        .deserialize_f64(visitor)
+                        .map_err(|err| error::fix_alias_mark(err, mark));
+                }
                 Event::Scalar(scalar)
                     if is_plain_or_tagged_literal_scalar(Tag::FLOAT, scalar, tagged_already) =>
                 {
@@ -1486,7 +1534,10 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
                     Err(invalid_type(next, &visitor))
                 }
             }
-            Event::Alias(mut pos) => self.jump(&mut pos)?.deserialize_str(visitor),
+            Event::Alias(mut pos) => self
+                .jump(&mut pos)?
+                .deserialize_str(visitor)
+                .map_err(|err| error::fix_alias_mark(err, mark)),
             other => Err(invalid_type(other, &visitor)),
         }
         .map_err(|err: Error| error::fix_mark(err, mark, self.path))
@@ -1520,8 +1571,12 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
     {
         let is_some = match self.peek_event()? {
             Event::Alias(mut pos) => {
+                let mark = self.peek_event_mark()?.1;
                 *self.pos += 1;
-                return self.jump(&mut pos)?.deserialize_option(visitor);
+                return self
+                    .jump(&mut pos)?
+                    .deserialize_option(visitor)
+                    .map_err(|err| error::fix_alias_mark(err, mark));
             }
             Event::Scalar(scalar) => {
                 let tagged_already = self.current_enum.is_some();
@@ -1586,7 +1641,10 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
                     ))
                 }
             }
-            Event::Alias(mut pos) => self.jump(&mut pos)?.deserialize_unit(visitor),
+            Event::Alias(mut pos) => self
+                .jump(&mut pos)?
+                .deserialize_unit(visitor)
+                .map_err(|err| error::fix_alias_mark(err, mark)),
             Event::Void => visitor.visit_unit(),
             other => Err(invalid_type(other, &visitor)),
         }
@@ -1615,7 +1673,10 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
     {
         let (next, mark) = self.next_event_mark()?;
         match next {
-            Event::Alias(mut pos) => self.jump(&mut pos)?.deserialize_seq(visitor),
+            Event::Alias(mut pos) => self
+                .jump(&mut pos)?
+                .deserialize_seq(visitor)
+                .map_err(|err| error::fix_alias_mark(err, mark)),
             Event::SequenceStart(_) => self.visit_sequence(visitor, mark),
             other => {
                 if match other {
@@ -1663,7 +1724,10 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
     {
         let (next, mark) = self.next_event_mark()?;
         match next {
-            Event::Alias(mut pos) => self.jump(&mut pos)?.deserialize_map(visitor),
+            Event::Alias(mut pos) => self
+                .jump(&mut pos)?
+                .deserialize_map(visitor)
+                .map_err(|err| error::fix_alias_mark(err, mark)),
             Event::MappingStart(_) => self.visit_mapping(visitor, mark),
             other => {
                 if match other {
@@ -1737,6 +1801,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
                     *self.pos += 1;
                     self.jump(&mut pos)?
                         .deserialize_enum(name, variants, visitor)
+                        .map_err(|err| error::fix_alias_mark(err, mark))
                 }
                 Event::Scalar(scalar) => {
                     if let Some(tag) = parse_tag(&scalar.tag) {
