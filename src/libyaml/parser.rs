@@ -23,7 +23,11 @@ pub(crate) enum Event<'input> {
     StreamStart,
     StreamEnd,
     DocumentStart,
-    DocumentEnd,
+    DocumentEnd {
+        /// Whether the document end was implied by EOF or a following `---`
+        /// rather than an explicit `...` end marker.
+        implicit: bool,
+    },
     Alias(Anchor),
     Scalar(Scalar<'input>),
     SequenceStart(SequenceStart),
@@ -109,7 +113,9 @@ unsafe fn convert_event<'input>(
         sys::YAML_STREAM_START_EVENT => Event::StreamStart,
         sys::YAML_STREAM_END_EVENT => Event::StreamEnd,
         sys::YAML_DOCUMENT_START_EVENT => Event::DocumentStart,
-        sys::YAML_DOCUMENT_END_EVENT => Event::DocumentEnd,
+        sys::YAML_DOCUMENT_END_EVENT => Event::DocumentEnd {
+            implicit: unsafe { sys.data.document_end.implicit },
+        },
         sys::YAML_ALIAS_EVENT => {
             Event::Alias(unsafe { optional_anchor(sys.data.alias.anchor) }.unwrap())
         }

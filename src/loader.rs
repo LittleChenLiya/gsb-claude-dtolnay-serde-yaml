@@ -9,6 +9,7 @@ use std::sync::Arc;
 pub(crate) struct Loader<'input> {
     parser: Option<Parser<'input>>,
     document_count: usize,
+    require_explicit_document_end: bool,
 }
 
 pub(crate) struct Document<'input> {
@@ -37,7 +38,15 @@ impl<'input> Loader<'input> {
         Ok(Loader {
             parser: Some(Parser::new(input)),
             document_count: 0,
+            require_explicit_document_end: false,
         })
+    }
+
+    /// Strict document termination mode: every document must be closed by an
+    /// explicit `...` end marker. Reaching EOF or the next `---` does not
+    /// count as an explicit end.
+    pub fn require_explicit_document_end(&mut self) {
+        self.require_explicit_document_end = true;
     }
 
     pub fn next_document(&mut self) -> Option<Document<'input>> {
@@ -78,7 +87,18 @@ impl<'input> Loader<'input> {
                     };
                 }
                 YamlEvent::DocumentStart => continue,
-                YamlEvent::DocumentEnd => return Some(document),
+                YamlEvent::DocumentEnd { implicit } => {
+                    if implicit && self.require_explicit_document_end {
+                        document.error = Some(
+                            error::new(ErrorImpl::MissingDocumentEnd(
+                                mark,
+                                self.document_count,
+                            ))
+                            .shared(),
+                        );
+                    }
+                    return Some(document);
+                }
                 YamlEvent::Alias(alias) => match anchors.get(&alias) {
                     Some(id) => Event::Alias(*id),
                     None => {

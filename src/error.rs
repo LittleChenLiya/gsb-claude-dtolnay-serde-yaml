@@ -24,6 +24,7 @@ pub(crate) enum ErrorImpl {
 
     EndOfStream,
     MoreThanOneDocument,
+    MissingDocumentEnd(libyaml::Mark, usize),
     RecursionLimitExceeded(libyaml::Mark),
     RepetitionLimitExceeded,
     BytesUnsupported,
@@ -197,6 +198,7 @@ impl ErrorImpl {
         match self {
             ErrorImpl::Message(_, Some(Pos { mark, path: _ }))
             | ErrorImpl::RecursionLimitExceeded(mark)
+            | ErrorImpl::MissingDocumentEnd(mark, _)
             | ErrorImpl::UnknownAnchor(mark) => Some(*mark),
             ErrorImpl::Libyaml(err) => Some(err.mark()),
             ErrorImpl::Shared(err) => err.mark(),
@@ -219,6 +221,11 @@ impl ErrorImpl {
             ErrorImpl::EndOfStream => f.write_str("EOF while parsing a value"),
             ErrorImpl::MoreThanOneDocument => f.write_str(
                 "deserializing from YAML containing more than one document is not supported",
+            ),
+            ErrorImpl::MissingDocumentEnd(_mark, document) => write!(
+                f,
+                "document {} is missing an explicit \"...\" document end marker",
+                document,
             ),
             ErrorImpl::RecursionLimitExceeded(_mark) => f.write_str("recursion limit exceeded"),
             ErrorImpl::RepetitionLimitExceeded => f.write_str("repetition limit exceeded"),

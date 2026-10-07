@@ -57,6 +57,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 /// ```
 pub struct Deserializer<'de> {
     progress: Progress<'de>,
+    require_explicit_document_end: bool,
 }
 
 pub(crate) enum Progress<'de> {
@@ -72,13 +73,19 @@ impl<'de> Deserializer<'de> {
     /// Creates a YAML deserializer from a `&str`.
     pub fn from_str(s: &'de str) -> Self {
         let progress = Progress::Str(s);
-        Deserializer { progress }
+        Deserializer {
+            progress,
+            require_explicit_document_end: false,
+        }
     }
 
     /// Creates a YAML deserializer from a `&[u8]`.
     pub fn from_slice(v: &'de [u8]) -> Self {
         let progress = Progress::Slice(v);
-        Deserializer { progress }
+        Deserializer {
+            progress,
+            require_explicit_document_end: false,
+        }
     }
 
     /// Creates a YAML deserializer from an `io::Read`.
@@ -91,7 +98,43 @@ impl<'de> Deserializer<'de> {
         R: io::Read + 'de,
     {
         let progress = Progress::Read(Box::new(rdr));
-        Deserializer { progress }
+        Deserializer {
+            progress,
+            require_explicit_document_end: false,
+        }
+    }
+
+    /// Enables strict document termination mode: every document in the YAML
+    /// stream must be closed by an explicit `...` end marker. Reaching EOF or
+    /// the `---` start marker of the next document does not count as an
+    /// explicit end.
+    ///
+    /// Documents that are not explicitly terminated are reported through an
+    /// error carrying the 1-based document number; the document itself and
+    /// the start of the following document are still processed normally.
+    ///
+    /// ```
+    /// use serde::Deserialize;
+    /// use serde_yaml::Value;
+    ///
+    /// let input = "---\nk: 1\n...\n---\nj: 2\n";
+    /// let mut documents = serde_yaml::Deserializer::from_str(input)
+    ///     .require_explicit_document_end();
+    ///
+    /// // First document is explicitly terminated.
+    /// let first = Value::deserialize(documents.next().unwrap()).unwrap();
+    /// assert_eq!(first["k"], 1);
+    ///
+    /// // Second document ends implicitly at EOF.
+    /// let err = Value::deserialize(documents.next().unwrap()).unwrap_err();
+    /// assert!(err.to_string().contains("document 2"));
+    /// ```
+    pub fn require_explicit_document_end(mut self) -> Self {
+        self.require_explicit_document_end = true;
+        if let Progress::Iterable(loader) = &mut self.progress {
+            loader.require_explicit_document_end();
+        }
+        self
     }
 
     fn de<T>(
@@ -121,6 +164,9 @@ impl<'de> Deserializer<'de> {
         }
 
         let mut loader = Loader::new(self.progress)?;
+        if self.require_explicit_document_end {
+            loader.require_explicit_document_end();
+        }
         let document = match loader.next_document() {
             Some(document) => document,
             None => return Err(error::new(ErrorImpl::EndOfStream)),
@@ -153,12 +199,14 @@ impl<'de> Iterator for Deserializer<'de> {
                 let document = loader.next_document()?;
                 return Some(Deserializer {
                     progress: Progress::Document(document),
+                    require_explicit_document_end: false,
                 });
             }
             Progress::Document(_) => return None,
             Progress::Fail(err) => {
                 return Some(Deserializer {
                     progress: Progress::Fail(Arc::clone(err)),
+                    require_explicit_document_end: false,
                 });
             }
             _ => {}
@@ -167,7 +215,10 @@ impl<'de> Iterator for Deserializer<'de> {
         let dummy = Progress::Str("");
         let input = mem::replace(&mut self.progress, dummy);
         match Loader::new(input) {
-            Ok(loader) => {
+            Ok(mut loader) => {
+                if self.require_explicit_document_end {
+                    loader.require_explicit_document_end();
+                }
                 self.progress = Progress::Iterable(loader);
                 self.next()
             }
@@ -176,6 +227,7 @@ impl<'de> Iterator for Deserializer<'de> {
                 self.progress = Progress::Fail(Arc::clone(&fail));
                 Some(Deserializer {
                     progress: Progress::Fail(fail),
+                    require_explicit_document_end: false,
                 })
             }
         }
