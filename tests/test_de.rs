@@ -7,6 +7,7 @@
 )]
 
 use indoc::indoc;
+use serde::de::Deserialize;
 use serde_derive::Deserialize;
 use serde_yaml::{Deserializer, Number, Value};
 use std::collections::BTreeMap;
@@ -714,4 +715,137 @@ fn test_parse_number() {
 
     let err = " 1 ".parse::<Number>().unwrap_err();
     assert_eq!(err.to_string(), "failed to parse YAML number");
+}
+
+#[test]
+fn test_require_explicit_document_end_single_ok() {
+    // One document terminated by an explicit `...` end marker.
+    let yaml = indoc! {"
+        ---
+        k: 107
+        ...
+    "};
+    let values = Deserializer::from_str(yaml)
+        .require_explicit_document_end()
+        .map(Value::deserialize)
+        .collect::<Result<Vec<Value>, _>>()
+        .unwrap();
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["k"], 107);
+}
+
+#[test]
+fn test_require_explicit_document_end_implicit_eof() {
+    // Document ends implicitly at EOF: error naming document 1.
+    let yaml = "k: 107\n";
+    let results: Vec<_> = Deserializer::from_str(yaml)
+        .require_explicit_document_end()
+        .map(Value::deserialize)
+        .collect();
+    assert_eq!(results.len(), 1);
+    let err = results.into_iter().next().unwrap().unwrap_err();
+    assert!(
+        err.to_string().contains("document 1"),
+        "unexpected error: {}",
+        err
+    );
+
+    // Default parsing is unchanged: implicit EOF is fine without strict mode.
+    let value = Deserializer::from_str(yaml)
+        .map(Value::deserialize)
+        .collect::<Result<Vec<Value>, _>>()
+        .unwrap();
+    assert_eq!(value[0]["k"], 107);
+}
+
+#[test]
+fn test_require_explicit_document_end_two_documents() {
+    // Two documents; the first is missing its `...` end marker. The error
+    // names document 1 and does not swallow the start of document 2.
+    let yaml = indoc! {"
+        ---
+        k: 107
+        ---
+        j: 106
+        ...
+    "};
+    let results: Vec<_> = Deserializer::from_str(yaml)
+        .require_explicit_document_end()
+        .map(Value::deserialize)
+        .collect();
+    assert_eq!(results.len(), 2);
+
+    let err = results[0].as_ref().unwrap_err();
+    assert!(
+        err.to_string().contains("document 1"),
+        "unexpected error: {}",
+        err
+    );
+
+    let second = results[1].as_ref().unwrap();
+    assert_eq!(second["j"], 106);
+
+    // Both documents missing the end marker: errors name documents 1 and 2.
+    let yaml = indoc! {"
+        ---
+        k: 107
+        ---
+        j: 106
+    "};
+    let results: Vec<_> = Deserializer::from_str(yaml)
+        .require_explicit_document_end()
+        .map(Value::deserialize)
+        .collect();
+    assert_eq!(results.len(), 2);
+    let err1 = results[0].as_ref().unwrap_err();
+    let err2 = results[1].as_ref().unwrap_err();
+    assert!(
+        err1.to_string().contains("document 1"),
+        "unexpected error: {}",
+        err1
+    );
+    assert!(
+        err2.to_string().contains("document 2"),
+        "unexpected error: {}",
+        err2
+    );
+}
+
+#[test]
+fn test_require_explicit_document_end_block_scalar() {
+    // A `...` line inside a block scalar is scalar content, not a document
+    // end marker: no false positive, and it does not satisfy strict mode.
+    let yaml = indoc! {"
+        ---
+        k: |
+          ...
+          still scalar content
+        ...
+    "};
+    let values = Deserializer::from_str(yaml)
+        .require_explicit_document_end()
+        .map(Value::deserialize)
+        .collect::<Result<Vec<Value>, _>>()
+        .unwrap();
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["k"], "...\nstill scalar content\n");
+
+    // Same block scalar without a real document end marker still errors.
+    let yaml = indoc! {"
+        ---
+        k: |
+          ...
+          still scalar content
+    "};
+    let results: Vec<_> = Deserializer::from_str(yaml)
+        .require_explicit_document_end()
+        .map(Value::deserialize)
+        .collect();
+    assert_eq!(results.len(), 1);
+    let err = results.into_iter().next().unwrap().unwrap_err();
+    assert!(
+        err.to_string().contains("document 1"),
+        "unexpected error: {}",
+        err
+    );
 }
