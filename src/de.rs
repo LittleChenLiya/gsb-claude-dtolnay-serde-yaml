@@ -1177,10 +1177,15 @@ fn invalid_type(event: &Event, exp: &dyn Expected) -> Error {
         Event::Alias(_) => unreachable!(),
         Event::Scalar(scalar) => {
             let get_type = InvalidType { exp };
-            match visit_scalar(get_type, scalar, false) {
+            let err = match visit_scalar(get_type, scalar, false) {
                 Ok(void) => match void {},
                 Err(invalid_type) => invalid_type,
-            }
+            };
+            // Attach the scalar's style (plain, quoted, or block) as a
+            // diagnostic hint. This does not change the message, position,
+            // or cause of the error, nor how values convert to the target
+            // type.
+            error::fix_scalar_style(err, scalar.style)
         }
         Event::SequenceStart(_) => de::Error::invalid_type(Unexpected::Seq, exp),
         Event::MappingStart(_) => de::Error::invalid_type(Unexpected::Map, exp),

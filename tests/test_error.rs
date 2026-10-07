@@ -6,7 +6,7 @@ use serde::de::Deserialize;
 use serde::de::{SeqAccess, Visitor};
 use serde_derive::{Deserialize, Serialize};
 use serde_yaml::value::{Tag, TaggedValue};
-use serde_yaml::{Deserializer, Value};
+use serde_yaml::{Deserializer, ScalarStyle, Value};
 #[cfg(not(miri))]
 use std::collections::BTreeMap;
 #[cfg(not(miri))]
@@ -497,4 +497,126 @@ fn test_duplicate_keys() {
     "};
     let expected = "duplicate entry in YAML map at line 2 column 1";
     test_error::<Value>(yaml, expected);
+}
+
+#[test]
+fn test_scalar_style_plain_success() {
+    // A plain integer scalar converts to the target integer type; the
+    // successful value carries no extra structure.
+    let value = serde_yaml::from_str::<i64>("107").unwrap();
+    assert_eq!(value, 107);
+
+    let value = serde_yaml::from_str::<i64>("-0x10").unwrap();
+    assert_eq!(value, -16);
+}
+
+#[test]
+fn test_scalar_style_plain_error() {
+    // A plain scalar that is not an integer fails with a `Plain` style hint,
+    // keeping line/column and the original message.
+    let err = serde_yaml::from_str::<i64>("abc").unwrap_err();
+    assert_eq!(err.scalar_style(), Some(ScalarStyle::Plain));
+    let location = err.location().unwrap();
+    assert_eq!(location.line(), 1);
+    assert_eq!(location.column(), 1);
+    // Note: serde_yaml omits the " at line .. column .." suffix when the
+    // error is at the very start of the input; the position is still
+    // available through `location()` as checked above.
+    assert_eq!(
+        err.to_string(),
+        "invalid type: string \"abc\", expected i64"
+    );
+}
+
+#[test]
+fn test_scalar_style_quoted_error() {
+    // Quoted numbers are strings, not integers: the conversion to the target
+    // type is unchanged, but the error reports a `Quoted` style hint.
+    let err = serde_yaml::from_str::<i64>("\"107\"").unwrap_err();
+    assert_eq!(err.scalar_style(), Some(ScalarStyle::Quoted));
+    let location = err.location().unwrap();
+    assert_eq!(location.line(), 1);
+    assert_eq!(location.column(), 1);
+    assert_eq!(
+        err.to_string(),
+        "invalid type: string \"107\", expected i64"
+    );
+
+    let err = serde_yaml::from_str::<i64>("'107'").unwrap_err();
+    assert_eq!(err.scalar_style(), Some(ScalarStyle::Quoted));
+}
+
+#[test]
+fn test_scalar_style_block_error() {
+    // Literal and folded block scalars report a `Block` style hint.
+    let err = serde_yaml::from_str::<i64>("|\n  107\n").unwrap_err();
+    assert_eq!(err.scalar_style(), Some(ScalarStyle::Block));
+    let location = err.location().unwrap();
+    assert_eq!(location.line(), 1);
+    assert_eq!(location.column(), 1);
+    // The newline of the block scalar's content is escaped in the message.
+    assert_eq!(
+        err.to_string(),
+        "invalid type: string \"107\\n\", expected i64"
+    );
+
+    let err = serde_yaml::from_str::<i64>(">\n  107\n").unwrap_err();
+    assert_eq!(err.scalar_style(), Some(ScalarStyle::Block));
+}
+
+#[test]
+fn test_scalar_style_multidoc_independent() {
+    // Each document of a multi-document stream is diagnosed independently:
+    // the second document's error carries its own position and style, never
+    // the style of a scalar from a previous document.
+    let yaml = "---\nabc\n...\n---\n\"def\"\n";
+    let mut documents = Deserializer::from_str(yaml);
+
+    let err = i64::deserialize(documents.next().unwrap()).unwrap_err();
+    assert_eq!(err.scalar_style(), Some(ScalarStyle::Plain));
+    let location = err.location().unwrap();
+    assert_eq!(location.line(), 2);
+    assert_eq!(location.column(), 1);
+
+    let err = i64::deserialize(documents.next().unwrap()).unwrap_err();
+    assert_eq!(err.scalar_style(), Some(ScalarStyle::Quoted));
+    let location = err.location().unwrap();
+    assert_eq!(location.line(), 5);
+    assert_eq!(location.column(), 1);
+    assert_eq!(
+        err.to_string(),
+        "invalid type: string \"def\", expected i64 at line 5 column 1"
+    );
+
+    assert!(documents.next().is_none());
+}
+
+#[test]
+fn test_scalar_style_from_reader_fixture() {
+    // Small in-memory fixture through the reader-based interface.
+    let input = b"'107'\n".to_vec();
+    let err = serde_yaml::from_reader::<_, i64>(input.as_slice()).unwrap_err();
+    assert_eq!(err.scalar_style(), Some(ScalarStyle::Quoted));
+    let location = err.location().unwrap();
+    assert_eq!(location.line(), 1);
+    assert_eq!(location.column(), 1);
+}
+
+#[test]
+fn test_scalar_style_temp_file_fixture() {
+    // Temporary-file fixture: deserialize a block scalar from a file on disk
+    // and check the style diagnostic.
+    let dir = std::env::temp_dir().join(format!("serde_yaml_scalar_style_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("block.yaml");
+    std::fs::write(&path, "|\n  107\n").unwrap();
+
+    let file = std::fs::File::open(&path).unwrap();
+    let err = serde_yaml::from_reader::<_, i64>(file).unwrap_err();
+    assert_eq!(err.scalar_style(), Some(ScalarStyle::Block));
+    let location = err.location().unwrap();
+    assert_eq!(location.line(), 1);
+    assert_eq!(location.column(), 1);
+
+    std::fs::remove_dir_all(&dir).unwrap();
 }

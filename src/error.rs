@@ -1,3 +1,4 @@
+use crate::libyaml::parser::ScalarStyle as LibyamlScalarStyle;
 use crate::libyaml::{emitter, error as libyaml};
 use crate::path::Path;
 use serde::{de, ser};
@@ -36,7 +37,51 @@ pub(crate) enum ErrorImpl {
     EmptyTag,
     FailedToParseNumber,
 
+    /// Diagnostic hint recording the style of the YAML scalar that an error
+    /// is about. This wraps the underlying error without changing its
+    /// message, position, or cause; it only exposes how the offending scalar
+    /// was written in the input (plain, quoted, or block).
+    ScalarStyleHint(Box<ErrorImpl>, ScalarStyle),
+
     Shared(Arc<ErrorImpl>),
+}
+
+/// The style in which a YAML scalar involved in an error was written.
+///
+/// This is a diagnostic hint attached to some deserialization errors. It
+/// describes the syntactic form of the offending scalar in the input and has
+/// no effect on how values are converted to the target serde type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ScalarStyle {
+    /// An unquoted scalar, for example `107`.
+    Plain,
+    /// A single-quoted or double-quoted scalar, for example `'107'` or
+    /// `"107"`.
+    Quoted,
+    /// A block scalar, either literal (`|`) or folded (`>`).
+    Block,
+}
+
+impl ScalarStyle {
+    pub(crate) fn from_libyaml(style: LibyamlScalarStyle) -> Self {
+        match style {
+            LibyamlScalarStyle::Plain => ScalarStyle::Plain,
+            LibyamlScalarStyle::SingleQuoted | LibyamlScalarStyle::DoubleQuoted => {
+                ScalarStyle::Quoted
+            }
+            LibyamlScalarStyle::Literal | LibyamlScalarStyle::Folded => ScalarStyle::Block,
+        }
+    }
+}
+
+impl Display for ScalarStyle {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ScalarStyle::Plain => f.write_str("plain"),
+            ScalarStyle::Quoted => f.write_str("quoted"),
+            ScalarStyle::Block => f.write_str("block"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -102,6 +147,30 @@ impl Error {
     pub fn location(&self) -> Option<Location> {
         self.0.location()
     }
+
+    /// Returns the style of the YAML scalar that this error is about, if the
+    /// error was caused by a scalar that could not be converted to the
+    /// requested type.
+    ///
+    /// This is purely a diagnostic hint: it reports whether the offending
+    /// scalar was written as a plain, quoted, or block scalar in the input.
+    /// Successfully deserialized values do not carry this information, and
+    /// each document of a multi-document stream is diagnosed independently.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use serde_yaml::{Error, ScalarStyle};
+    /// #
+    /// // A quoted scalar is a string, not an integer.
+    /// let err = serde_yaml::from_str::<i64>("\"107\"").unwrap_err();
+    ///
+    /// assert_eq!(err.scalar_style(), Some(ScalarStyle::Quoted));
+    /// assert_eq!(err.location().unwrap().line(), 1);
+    /// ```
+    pub fn scalar_style(&self) -> Option<ScalarStyle> {
+        self.0.scalar_style()
+    }
 }
 
 pub(crate) fn new(inner: ErrorImpl) -> Error {
@@ -113,13 +182,37 @@ pub(crate) fn shared(shared: Arc<ErrorImpl>) -> Error {
 }
 
 pub(crate) fn fix_mark(mut error: Error, mark: libyaml::Mark, path: Path) -> Error {
-    if let ErrorImpl::Message(_, none @ None) = error.0.as_mut() {
-        *none = Some(Pos {
-            mark,
-            path: path.to_string(),
-        });
+    match error.0.as_mut() {
+        ErrorImpl::Message(_, none @ None) => {
+            *none = Some(Pos {
+                mark,
+                path: path.to_string(),
+            });
+        }
+        ErrorImpl::ScalarStyleHint(inner, _) => {
+            if let ErrorImpl::Message(_, none @ None) = inner.as_mut() {
+                *none = Some(Pos {
+                    mark,
+                    path: path.to_string(),
+                });
+            }
+        }
+        _ => {}
     }
     error
+}
+
+/// Attaches a scalar style hint to an error caused by a YAML scalar. The
+/// wrapped error keeps its message, line/column position, and cause; only
+/// the style diagnostic is added.
+pub(crate) fn fix_scalar_style(error: Error, style: LibyamlScalarStyle) -> Error {
+    if let ErrorImpl::ScalarStyleHint(..) = *error.0 {
+        return error;
+    }
+    Error(Box::new(ErrorImpl::ScalarStyleHint(
+        error.0,
+        ScalarStyle::from_libyaml(style),
+    )))
 }
 
 impl Error {
@@ -188,7 +281,16 @@ impl ErrorImpl {
         match self {
             ErrorImpl::Io(err) => err.source(),
             ErrorImpl::FromUtf8(err) => err.source(),
+            ErrorImpl::ScalarStyleHint(err, _) => err.source(),
             ErrorImpl::Shared(err) => err.source(),
+            _ => None,
+        }
+    }
+
+    fn scalar_style(&self) -> Option<ScalarStyle> {
+        match self {
+            ErrorImpl::ScalarStyleHint(_, style) => Some(*style),
+            ErrorImpl::Shared(err) => err.scalar_style(),
             _ => None,
         }
     }
@@ -199,6 +301,7 @@ impl ErrorImpl {
             | ErrorImpl::RecursionLimitExceeded(mark)
             | ErrorImpl::UnknownAnchor(mark) => Some(*mark),
             ErrorImpl::Libyaml(err) => Some(err.mark()),
+            ErrorImpl::ScalarStyleHint(err, _) => err.mark(),
             ErrorImpl::Shared(err) => err.mark(),
             _ => None,
         }
@@ -241,6 +344,7 @@ impl ErrorImpl {
             }
             ErrorImpl::EmptyTag => f.write_str("empty YAML tag is not allowed"),
             ErrorImpl::FailedToParseNumber => f.write_str("failed to parse YAML number"),
+            ErrorImpl::ScalarStyleHint(err, _) => err.message_no_mark(f),
             ErrorImpl::Shared(_) => unreachable!(),
         }
     }
@@ -248,6 +352,7 @@ impl ErrorImpl {
     fn display(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ErrorImpl::Libyaml(err) => Display::fmt(err, f),
+            ErrorImpl::ScalarStyleHint(err, _) => err.display(f),
             ErrorImpl::Shared(err) => err.display(f),
             _ => {
                 self.message_no_mark(f)?;
@@ -264,6 +369,7 @@ impl ErrorImpl {
     fn debug(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ErrorImpl::Libyaml(err) => Debug::fmt(err, f),
+            ErrorImpl::ScalarStyleHint(err, _) => err.debug(f),
             ErrorImpl::Shared(err) => err.debug(f),
             _ => {
                 f.write_str("Error(")?;
