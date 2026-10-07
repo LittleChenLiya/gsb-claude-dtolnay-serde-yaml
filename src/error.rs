@@ -43,6 +43,41 @@ pub(crate) enum ErrorImpl {
 pub(crate) struct Pos {
     mark: libyaml::Mark,
     path: String,
+    style: Option<ScalarStyle>,
+}
+
+/// The style of the YAML scalar that an error is associated with.
+///
+/// This is a coarse classification of the scalar styles defined by YAML,
+/// provided as a type hint on deserialization errors caused by a scalar. It
+/// does not affect how scalars are converted to the serde data model; it only
+/// describes how the offending scalar was written in the input.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ScalarStyle {
+    /// A plain (unquoted) scalar, for example `123`.
+    Plain,
+    /// A quoted scalar, either single quoted `'123'` or double quoted
+    /// `"123"`.
+    Quoted,
+    /// A block scalar, either literal `|` or folded `>`.
+    Block,
+}
+
+impl ScalarStyle {
+    /// Returns `"plain"`, `"quoted"` or `"block"`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScalarStyle::Plain => "plain",
+            ScalarStyle::Quoted => "quoted",
+            ScalarStyle::Block => "block",
+        }
+    }
+}
+
+impl Display for ScalarStyle {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// The input location that an error occured.
@@ -102,6 +137,33 @@ impl Error {
     pub fn location(&self) -> Option<Location> {
         self.0.location()
     }
+
+    /// Returns the style of the YAML scalar that the error is associated
+    /// with, if the error was caused by a scalar.
+    ///
+    /// This is a diagnostic hint only: it indicates whether the offending
+    /// scalar was written as a plain, quoted or block scalar in the input.
+    /// It does not change how scalars are converted to the target type, and
+    /// successful values never carry this information. In a multi-document
+    /// stream each error refers to the style of the scalar in the document
+    /// that produced it, never to a previous document.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use serde_yaml::ScalarStyle;
+    /// // A quoted number cannot deserialize as an integer; the error
+    /// // reports that the scalar was quoted.
+    /// let err = serde_yaml::from_str::<i64>("\"123\"").unwrap_err();
+    /// assert_eq!(err.scalar_style(), Some(ScalarStyle::Quoted));
+    ///
+    /// // A plain number deserializes fine and carries no extra structure.
+    /// let int = serde_yaml::from_str::<i64>("123").unwrap();
+    /// assert_eq!(int, 123);
+    /// ```
+    pub fn scalar_style(&self) -> Option<ScalarStyle> {
+        self.0.scalar_style()
+    }
 }
 
 pub(crate) fn new(inner: ErrorImpl) -> Error {
@@ -112,11 +174,17 @@ pub(crate) fn shared(shared: Arc<ErrorImpl>) -> Error {
     Error(Box::new(ErrorImpl::Shared(shared)))
 }
 
-pub(crate) fn fix_mark(mut error: Error, mark: libyaml::Mark, path: Path) -> Error {
+pub(crate) fn fix_mark(
+    mut error: Error,
+    mark: libyaml::Mark,
+    path: Path,
+    style: Option<ScalarStyle>,
+) -> Error {
     if let ErrorImpl::Message(_, none @ None) = error.0.as_mut() {
         *none = Some(Pos {
             mark,
             path: path.to_string(),
+            style,
         });
     }
     error
@@ -184,6 +252,14 @@ impl ErrorImpl {
         self.mark().map(Location::from_mark)
     }
 
+    fn scalar_style(&self) -> Option<ScalarStyle> {
+        match self {
+            ErrorImpl::Message(_, Some(Pos { style, .. })) => *style,
+            ErrorImpl::Shared(err) => err.scalar_style(),
+            _ => None,
+        }
+    }
+
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             ErrorImpl::Io(err) => err.source(),
@@ -195,7 +271,7 @@ impl ErrorImpl {
 
     fn mark(&self) -> Option<libyaml::Mark> {
         match self {
-            ErrorImpl::Message(_, Some(Pos { mark, path: _ }))
+            ErrorImpl::Message(_, Some(Pos { mark, .. }))
             | ErrorImpl::RecursionLimitExceeded(mark)
             | ErrorImpl::UnknownAnchor(mark) => Some(*mark),
             ErrorImpl::Libyaml(err) => Some(err.mark()),
@@ -207,7 +283,7 @@ impl ErrorImpl {
     fn message_no_mark(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ErrorImpl::Message(msg, None) => f.write_str(msg),
-            ErrorImpl::Message(msg, Some(Pos { mark: _, path })) => {
+            ErrorImpl::Message(msg, Some(Pos { mark: _, path, .. })) => {
                 if path != "." {
                     write!(f, "{}: ", path)?;
                 }

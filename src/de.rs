@@ -1158,8 +1158,21 @@ fn is_plain_or_tagged_literal_scalar(
     }
 }
 
-fn invalid_type(event: &Event, exp: &dyn Expected) -> Error {
-    enum Void {}
+// Coarse scalar style hint attached to deserialization errors caused by a
+// scalar. This is diagnostic only; it does not affect how the scalar is
+// converted to the target type.
+fn scalar_style(event: &Event) -> Option<error::ScalarStyle> {
+    match event {
+        Event::Scalar(scalar) => Some(match scalar.style {
+            ScalarStyle::Plain => error::ScalarStyle::Plain,
+            ScalarStyle::SingleQuoted | ScalarStyle::DoubleQuoted => error::ScalarStyle::Quoted,
+            ScalarStyle::Literal | ScalarStyle::Folded => error::ScalarStyle::Block,
+        }),
+        _ => None,
+    }
+}
+
+fn invalid_type(event: &Event, exp: &dyn Expected) -> Error {    enum Void {}
 
     struct InvalidType<'a> {
         exp: &'a dyn Expected,
@@ -1260,7 +1273,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
         }
         // The de::Error impl creates errors with unknown line and column. Fill
         // in the position here by looking at the current index in the input.
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, scalar_style(next)))
     }
 
     fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value>
@@ -1285,7 +1298,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
             }
             break Err(invalid_type(next, &visitor));
         }
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, scalar_style(next)))
     }
 
     fn deserialize_i8<V>(self, visitor: V) -> Result<V::Value>
@@ -1331,7 +1344,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
             }
             break Err(invalid_type(next, &visitor));
         }
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, scalar_style(next)))
     }
 
     fn deserialize_i128<V>(self, visitor: V) -> Result<V::Value>
@@ -1356,7 +1369,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
             }
             break Err(invalid_type(next, &visitor));
         }
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, scalar_style(next)))
     }
 
     fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value>
@@ -1402,7 +1415,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
             }
             break Err(invalid_type(next, &visitor));
         }
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, scalar_style(next)))
     }
 
     fn deserialize_u128<V>(self, visitor: V) -> Result<V::Value>
@@ -1427,7 +1440,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
             }
             break Err(invalid_type(next, &visitor));
         }
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, scalar_style(next)))
     }
 
     fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value>
@@ -1459,7 +1472,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
             }
             break Err(invalid_type(next, &visitor));
         }
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, scalar_style(next)))
     }
 
     fn deserialize_char<V>(self, visitor: V) -> Result<V::Value>
@@ -1489,7 +1502,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
             Event::Alias(mut pos) => self.jump(&mut pos)?.deserialize_str(visitor),
             other => Err(invalid_type(other, &visitor)),
         }
-        .map_err(|err: Error| error::fix_mark(err, mark, self.path))
+        .map_err(|err: Error| error::fix_mark(err, mark, self.path, scalar_style(next)))
     }
 
     fn deserialize_string<V>(self, visitor: V) -> Result<V::Value>
@@ -1590,7 +1603,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
             Event::Void => visitor.visit_unit(),
             other => Err(invalid_type(other, &visitor)),
         }
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, scalar_style(next)))
     }
 
     fn deserialize_unit_struct<V>(self, _name: &'static str, visitor: V) -> Result<V::Value>
@@ -1635,7 +1648,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
                 }
             }
         }
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, scalar_style(next)))
     }
 
     fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value>
@@ -1684,7 +1697,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
                 }
             }
         }
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, scalar_style(next)))
     }
 
     fn deserialize_struct<V>(
@@ -1758,7 +1771,7 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
                     }
                     let err =
                         de::Error::invalid_type(Unexpected::Map, &"a YAML tag starting with '!'");
-                    Err(error::fix_mark(err, mark, self.path))
+                    Err(error::fix_mark(err, mark, self.path, scalar_style(next)))
                 }
                 Event::SequenceStart(sequence) => {
                     if let Some(tag) = parse_tag(&sequence.tag) {
@@ -1770,14 +1783,14 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
                     }
                     let err =
                         de::Error::invalid_type(Unexpected::Seq, &"a YAML tag starting with '!'");
-                    Err(error::fix_mark(err, mark, self.path))
+                    Err(error::fix_mark(err, mark, self.path, scalar_style(next)))
                 }
                 Event::SequenceEnd => panic!("unexpected end of sequence"),
                 Event::MappingEnd => panic!("unexpected end of mapping"),
                 Event::Void => Err(error::new(ErrorImpl::EndOfStream)),
             };
         }
-        .map_err(|err| error::fix_mark(err, mark, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path, scalar_style(next)))
     }
 
     fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value>
